@@ -100,21 +100,18 @@ jobs:
             "refs/tags/${TARGET_VERSION}:refs/tags/${TARGET_VERSION}"
 
           update_patch="$(mktemp)"
+          # 上游在 v0.22.3 删除了整个 .github 目录。本 fork 的部署链路位于
+          # .github/workflows，若把上游的删除动作应用进来会连带删掉 deploy
+          # workflow 与 sync workflow，升级后部署链路直接断掉。
+          # 因此生成 diff 时排除 .github，本 fork 保留自己的 workflow。
           git diff --binary --full-index \
             "refs/tags/v${CURRENT_VERSION}" \
-            "refs/tags/${TARGET_VERSION}" > "${update_patch}"
+            "refs/tags/${TARGET_VERSION}" \
+            -- . ':(exclude).github' > "${update_patch}"
           if ! git apply --3way --index "${update_patch}"; then
             echo "The deployment repository conflicts with ${TARGET_VERSION}. Resolve the update manually." >&2
             exit 1
           fi
-
-          # 上游在 v0.22.3 删除了整个 .github 目录。本 fork 的部署 workflow 位于
-          # .github/workflows，若上游删除动作被应用进来会连带删掉部署链路。
-          # 恢复本 fork 的 workflow 目录后再提交。
-          if [[ -d .github/workflows ]]; then
-            git checkout HEAD -- .github/workflows 2>/dev/null || true
-          fi
-          git checkout HEAD -- .github 2>/dev/null || true
 
           git commit -m "Update FlareMo from v${CURRENT_VERSION} to ${TARGET_VERSION}"
 
