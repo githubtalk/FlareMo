@@ -1,0 +1,140 @@
+# 每日同步上游 FlareMo 最新稳定 Release 并自动发布到 Cloudflare。
+#
+# 上游 realchendahuang/FlareMo 已移除自带 CI/CD，本 fork 自建同步与部署链路：
+#   1. 查上游最新 Release tag，与仓库当前 version 比较；
+#   2. 有新版则把「当前 version → 目标 tag」的差异 three-way apply 到 main，
+#      保留本 fork 的 .github/workflows（上游删过该目录，不能被覆盖掉）；
+#   3. push 到 main，触发 Deploy to Cloudflare 完成构建、D1 migration 与发布。
+#
+# 不降级：目标版本低于当前版本直接退出。
+name: Sync upstream FlareMo release
+
+on:
+  schedule:
+    # 每天 04:23 UTC
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to install, for example v0.22.3. Leave empty for latest."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: flaremo-sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'realchendahuang/FlareMo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      GH_TOKEN: ${{ github.token }}
+      REQUESTED_VERSION: ${{ inputs.version }}
+      UPSTREAM_REPOSITORY: realchendahuang/FlareMo
+    steps:
+      - name: Check out deployment repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Resolve target release
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target_version="${REQUESTED_VERSION}"
+          if [[ -z "${target_version}" ]]; then
+            target_version="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
+          if [[ ! "${target_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid FlareMo release tag: ${target_version}" >&2
+            exit 1
+          fi
+
+          current_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          if [[ ! "${current_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid installed FlareMo version: ${current_version}" >&2
+            exit 1
+          fi
+
+          target_number="${target_version#v}"
+          IFS=. read -r current_major current_minor current_patch <<< "${current_version}"
+          IFS=. read -r target_major target_minor target_patch <<< "${target_number}"
+          if (( target_major < current_major ||
+                (target_major == current_major && target_minor < current_minor) ||
+                (target_major == current_major && target_minor == current_minor && target_patch < current_patch) )); then
+            echo "Refusing to downgrade FlareMo from v${current_version} to ${target_version}." >&2
+            exit 1
+          fi
+          if [[ "${target_number}" == "${current_version}" ]]; then
+            echo "${target_version} is already installed; nothing to do."
+            echo "already_current=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "target_version=${target_version}" >> "$GITHUB_OUTPUT"
+          echo "current_version=${current_version}" >> "$GITHUB_OUTPUT"
+          echo "already_current=false" >> "$GITHUB_OUTPUT"
+
+      - name: Apply upstream release diff
+        if: steps.resolve.outputs.already_current == 'false'
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ steps.resolve.outputs.target_version }}
+          CURRENT_VERSION: ${{ steps.resolve.outputs.current_version }}
+        run: |
+          set -euo pipefail
+
+          git remote add flaremo-upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags flaremo-upstream \
+            "refs/tags/v${CURRENT_VERSION}:refs/tags/v${CURRENT_VERSION}" \
+            "refs/tags/${TARGET_VERSION}:refs/tags/${TARGET_VERSION}"
+
+          update_patch="$(mktemp)"
+          git diff --binary --full-index \
+            "refs/tags/v${CURRENT_VERSION}" \
+            "refs/tags/${TARGET_VERSION}" > "${update_patch}"
+          if ! git apply --3way --index "${update_patch}"; then
+            echo "The deployment repository conflicts with ${TARGET_VERSION}. Resolve the update manually." >&2
+            exit 1
+          fi
+
+          # 上游在 v0.22.3 删除了整个 .github 目录。本 fork 的部署 workflow 位于
+          # .github/workflows，若上游删除动作被应用进来会连带删掉部署链路。
+          # 恢复本 fork 的 workflow 目录后再提交。
+          if [[ -d .github/workflows ]]; then
+            git checkout HEAD -- .github/workflows 2>/dev/null || true
+          fi
+          git checkout HEAD -- .github 2>/dev/null || true
+
+          git commit -m "Update FlareMo from v${CURRENT_VERSION} to ${TARGET_VERSION}"
+
+      - name: Push upgrade
+        if: steps.resolve.outputs.already_current == 'false'
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ steps.resolve.outputs.target_version }}
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${BASE_BRANCH}"
+          echo "Pushed FlareMo ${TARGET_VERSION} to ${BASE_BRANCH}; Deploy to Cloudflare will publish it."
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### FlareMo upstream sync"
+            echo
+            echo "- upstream: \`${UPSTREAM_REPOSITORY}\`"
+            echo "- target: \`${{ steps.resolve.outputs.target_version || 'already current' }}\`"
+            echo "- current: \`${{ steps.resolve.outputs.current_version || 'n/a' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
